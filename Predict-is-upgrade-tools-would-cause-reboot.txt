@@ -1,0 +1,137 @@
+Set Args = wscript.Arguments
+
+
+If Args.Count() < 2 Then
+	wscript.echo "Usage: RebootPredict_mainfest.vbs <Abs path to installed manifest> <Abs path to new manifest>"
+	Wscript.Quit 1
+End If
+
+'Compare two values in format of x.x.x.x#x
+'True if pre < pro
+'False if pre >= pro
+Function needUpgrade(version1,version2)
+	'wscript.echo "version1 is " + Split(version1,"#")(0) + " version 2 is " + Split(version2,"#")(0)
+	numbersPre = Split(Split(version1,"#")(0),".")
+	numbersPro = Split(Split(version2,"#")(0),".")
+	count = UBound(numbersPro)
+	If UBound(numbersPre) <= UBound(numbersPro) Then count = UBound(numbersPre)
+	'wscript.echo "count is " & count
+	For index = 0 To count
+		If numbersPre(index) > numbersPro(index) Then 
+			needUpgrade = False
+			Exit Function
+		ELSEIF numbersPre(index) < numbersPro(index) Then 
+			needUpgrade = True
+			Exit Function
+		End If
+	Next
+	If UBound(numbersPre) >= UBound(numbersPro) Then
+		needUpgrade = False
+	ELSE
+		needUpgrade = True
+	END If
+End Function
+
+'rebootTable follows https://wiki.eng.vmware.com/PIT/OP/MinimizeReboots
+Dim rebootTable
+set rebootTable = CreateObject("System.Collections.SortedList")
+rebootTable("Win2K") = "xpdm,vmmouse_win2k,buslogic_win2k,vmci_win2k,vsocklib_win2k,vsock_win2k"
+rebootTable("Win2K3") = "xpdm,vmmouse_win2k3,buslogic_win2k3,pvscsi_win2k3,pvscsi_XP,vmci_win2k3,vsocklib_win2k3,vsock_win2k3"
+rebootTable("Vista") = "xpdm,vmmouse,buslogic,pvscsi,pvscsi_2008,vmci,vsocklib,vsock,vnetflt"
+
+Set SystemSet = GetObject("winmgmts:").InstancesOf ("Win32_OperatingSystem") 
+Dim OS
+For each System in SystemSet
+	WScript.Echo System.Caption 
+	OS = System.Caption 
+Next
+Dim osIndex
+Select Case True
+   Case InStr(OS, "Windows 2000") > 1 : osIndex = "Win2K"
+   Case InStr(OS, "Windows XP") > 1 : osIndex = "Win2K3"	
+   Case InStr(OS, "Windows 2003") > 1 : osIndex = "Win2K3"
+   Case Else : osIndex = "Vista"
+End Select
+wscript.echo osIndex
+wscript.echo rebootTable(osIndex)
+
+wscript.echo "---------------------------------------------------------------"
+
+
+'Read the manifest file to parse modules already installed
+Dim fso
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+Dim modulesTable
+set modulesTable = CreateObject("System.Collections.SortedList")
+
+Const READONLY = 1 
+'Read new manifest to hashtable
+Set objTextFile = fso.OpenTextFile(Args.item(0), READONLY)  
+
+Dim moduleReg
+Set moduleReg = new regexp
+moduleReg.Pattern = "(.*)\.installed\s*=\s*""(.*)"""
+Do Until objTextFile.AtEndOfStream 
+    strNextLine = objTextFile.Readline
+	Set moduleMatches = moduleReg.Execute(strNextLine)
+	If moduleMatches.Count > 0 Then
+		moduleName = moduleMatches(0).SubMatches(0)
+		moduleInstalled = moduleMatches(0).SubMatches(1)
+		If StrComp(moduleInstalled,"TRUE",vbTextCompare) = 0 Then
+			Set versionReg = new regexp
+			versionReg.Pattern = moduleName + "\.version\s*=\s*""(.*)"""
+			strNextLine = objTextFile.Readline
+			Set versionMatches = versionReg.Execute(strNextLine)
+			if versionMatches.Count > 0 Then
+				versionValue = versionMatches(0).SubMatches(0)
+				wscript.echo "moduleName is " + moduleName + " and Version is " + versionValue
+				modulesTable.Add moduleName,versionValue
+			End If
+		End If
+	End If
+Loop 
+
+
+
+
+'Read the manifest file to parse module to be installed and compare already installed modules
+'Keep only the modules to be upgrade and causing reboot in the final table
+Set objTextFile = fso.OpenTextFile(Args.item(1), READONLY)
+Do Until objTextFile.AtEndOfStream
+	strNextLine = objTextFile.Readline
+	Set installVerionReg = new regexp
+	installVerionReg.Pattern = "(.*)\.version\s*=\s*""(.*)"""
+	Set installModuleMatches = installVerionReg.Execute(strNextLine)
+	If installModuleMatches.Count > 0 Then
+		moduleToInstall = installModuleMatches(0).SubMatches(0)
+		versionToInstall = installModuleMatches(0).SubMatches(1)
+		'handle already installed module
+		If modulesTable.ContainsKey(moduleToInstall) Then
+			'wscript.echo "Find module " + moduleToInstall
+			'wscript.echo "Installed version is " + modulesTable(moduleToInstall)
+			'wscript.echo "To be installed version is " + versionToInstall
+			If Not needUpgrade(modulesTable(moduleToInstall), versionToInstall) Then 
+				modulesTable.Remove(moduleToInstall)
+			ElseIf InStr(rebootTable(osIndex),moduleToInstall + ",") = 0 And InStr(rebootTable(osIndex),"," + moduleToInstall) = 0 Then
+				wscript.echo "module " + moduleToInstall + " would be updated from " + modulesTable(moduleToInstall) + " to " + versionToInstall + " but would not cause reboot"
+				modulesTable.Remove(moduleToInstall)
+			Else
+				wscript.echo "module " + moduleToInstall + " would be updated from " + modulesTable(moduleToInstall) + " to " + versionToInstall + " and would cause reboot"
+			End If
+		'handle freshly installed module
+		ElseIf InStr(rebootTable(osIndex),moduleToInstall + ",") > 0 Or InStr(rebootTable(osIndex),"," + moduleToInstall) > 0 Then
+			wscript.echo "module " + moduleToInstall + " would be freshly installed and would cause reboot"
+			modulesTable.Add moduleToInstall,versionToInstall
+		Else
+			wscript.echo "module " + moduleToInstall + " would be freshly installed but would not cause reboot"
+		End If
+	End If
+Loop
+
+wscript.echo "**************************************************************"
+
+For index = 0 to modulesTable.Count - 1
+	wscript.echo "Install/upgrade module " + modulesTable.Getkey(index) + " would cause reboot"
+Next
+
